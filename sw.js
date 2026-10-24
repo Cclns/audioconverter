@@ -1,4 +1,4 @@
-const CACHE_NAME = 'audio-extractor-v2';
+const CACHE_NAME = 'audio-extractor-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -12,12 +12,10 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(ASSETS);
-    })
-  );
   self.skipWaiting();
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS))
+  );
 });
 
 self.addEventListener('activate', (event) => {
@@ -30,19 +28,21 @@ self.addEventListener('activate', (event) => {
           }
         })
       );
-    })
+    }).then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
 
 self.addEventListener('fetch', (event) => {
+  // Network first for HTML/JS/CSS to ensure instant updates, cache fallback
   event.respondWith(
-    caches.match(event.request).then((cachedResponse) => {
-      return cachedResponse || fetch(event.request).catch(() => {
-        if (event.request.mode === 'navigate') {
-          return caches.match('./index.html');
+    fetch(event.request)
+      .then((networkResponse) => {
+        if (networkResponse && networkResponse.status === 200 && event.request.method === 'GET') {
+          const responseClone = networkResponse.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, responseClone));
         }
-      });
-    })
+        return networkResponse;
+      })
+      .catch(() => caches.match(event.request))
   );
 });

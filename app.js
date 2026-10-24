@@ -1,7 +1,9 @@
-// Register Service Worker for offline PWA
+// Register Service Worker with active update check
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js').catch(err => {
+    navigator.serviceWorker.register('./sw.js').then((reg) => {
+      reg.update();
+    }).catch(err => {
       console.warn('ServiceWorker registration failed:', err);
     });
   });
@@ -244,7 +246,8 @@ function demuxWithMP4Box(arrayBuffer) {
       return;
     }
 
-    const mp4boxfile = MP4Box.createFile();
+    // Pass true to keepMdatData so raw sample data is preserved when moov is at the end (iPhone camera videos)
+    const mp4boxfile = MP4Box.createFile(true);
     let audioTrack = null;
     let videoTrack = null;
     const audioSamples = [];
@@ -281,6 +284,20 @@ function demuxWithMP4Box(arrayBuffer) {
       bufferCopy.fileStart = 0;
       mp4boxfile.appendBuffer(bufferCopy);
       mp4boxfile.flush();
+
+      // If moov was at the end and samples were not extracted yet, seek and pump
+      if (audioSamples.length === 0 && mp4boxfile.seek) {
+        try {
+          const seekInfo = mp4boxfile.seek(0, true);
+          const startOffset = (seekInfo && isFinite(seekInfo.offset)) ? seekInfo.offset : 0;
+          const retryChunk = arrayBuffer.slice(startOffset);
+          retryChunk.fileStart = startOffset;
+          mp4boxfile.appendBuffer(retryChunk);
+          mp4boxfile.flush();
+        } catch (seekErr) {
+          console.warn('Seek retry warning:', seekErr);
+        }
+      }
     } catch (err) {
       reject(err);
       return;
