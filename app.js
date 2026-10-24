@@ -10,7 +10,6 @@ if ('serviceWorker' in navigator) {
 // DOM Elements
 const dropZone = document.getElementById('dropZone');
 const videoInput = document.getElementById('videoInput');
-const pickerLabel = document.getElementById('pickerLabel');
 const statusSection = document.getElementById('statusSection');
 const statusText = document.getElementById('statusText');
 const progressBar = document.getElementById('progressBar');
@@ -34,18 +33,31 @@ let currentWavFile = null;
 let currentFileName = 'extracted_audio.wav';
 let audioCtx = null;
 
+// iOS AudioContext unlock on initial user touch
+function unlockAudioContext() {
+  if (!audioCtx) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AudioContextClass();
+  }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+}
+
 // File picker triggers
 dropZone.addEventListener('click', () => {
+  unlockAudioContext();
   videoInput.click();
 });
 
 videoInput.addEventListener('change', (e) => {
   if (e.target.files && e.target.files.length > 0) {
+    unlockAudioContext();
     handleVideoFile(e.target.files[0]);
   }
 });
 
-// Drag and drop support (useful on Mac / desktop)
+// Drag and drop support
 ['dragenter', 'dragover'].forEach(eventName => {
   dropZone.addEventListener(eventName, (e) => {
     e.preventDefault();
@@ -62,6 +74,7 @@ videoInput.addEventListener('change', (e) => {
 
 dropZone.addEventListener('drop', (e) => {
   if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+    unlockAudioContext();
     handleVideoFile(e.dataTransfer.files[0]);
   }
 });
@@ -79,14 +92,13 @@ resetBtn.addEventListener('click', () => {
   currentWavFile = null;
 });
 
-// Update progress bar helper
 function setProgress(percent, message) {
   statusSection.classList.add('active');
   progressBar.style.width = `${percent}%`;
+  progressBar.style.background = 'var(--accent-gradient)';
   statusText.textContent = message;
 }
 
-// Format seconds into MM:SS
 function formatDuration(seconds) {
   if (isNaN(seconds) || seconds < 0) return '00:00';
   const m = Math.floor(seconds / 60);
@@ -94,48 +106,70 @@ function formatDuration(seconds) {
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 }
 
-// Format bytes into readable MB
 function formatFileSize(bytes) {
   const mb = bytes / (1024 * 1024);
   return `${mb.toFixed(1)} MB`;
 }
 
-// Main Video Processing Routine
+// Map AAC sample rates to 4-bit index for ADTS headers
+const AAC_SAMPLE_RATES = {
+  96000: 0x0, 88200: 0x1, 64000: 0x2, 48000: 0x3,
+  44100: 0x4, 32000: 0x5, 24000: 0x6, 22050: 0x7,
+  16000: 0x8, 12000: 0x9, 11025: 0xa, 8000: 0xb, 7350: 0xc
+};
+
+// Main processing pipeline
 async function handleVideoFile(file) {
   if (!file) return;
 
-  // Derive audio filename from video filename
   const baseName = file.name.substring(0, file.name.lastIndexOf('.')) || 'audio';
   currentFileName = `${baseName}.wav`;
 
   dropZone.style.display = 'none';
   analysisSection.classList.remove('active');
-  setProgress(15, 'Reading video metadata...');
-
-  let videoMeta = { width: null, height: null, duration: null };
+  setProgress(5, 'Loading video from Camera Roll...');
 
   try {
-    // 1. Extract video metadata via HTML5 video element
-    videoMeta = await extractVideoMetadata(file);
-    setProgress(35, 'Decoding audio track from video...');
+    // 1. Read file as ArrayBuffer with smooth progress
+    const arrayBuffer = await readFileAsArrayBuffer(file, (loaded, total) => {
+      const pct = Math.round((loaded / total) * 35) + 5;
+      const mbLoaded = (loaded / (1024 * 1024)).toFixed(1);
+      const mbTotal = (total / (1024 * 1024)).toFixed(1);
+      setProgress(pct, `Reading video (${mbLoaded}/${mbTotal} MB)...`);
+    });
 
-    // 2. Read file as ArrayBuffer & decode via Web Audio API
-    const arrayBuffer = await file.arrayBuffer();
-    setProgress(60, 'Processing audio stream...');
+    setProgress(45, 'Demuxing audio track...');
 
-    if (!audioCtx) {
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      audioCtx = new AudioContextClass();
+    // 2. Try demuxing with MP4Box (fast & reliable for all iPhone MOV/MP4 recordings)
+    let audioBuffer = null;
+    let videoMeta = { width: null, height: null, duration: null };
+
+    try {
+      const demuxResult = await demuxWithMP4Box(arrayBuffer);
+      videoMeta = demuxResult.videoMeta;
+
+      setProgress(65, 'Decoding audio samples to PCM...');
+
+      if (demuxResult.aacData) {
+        // Pure ADTS AAC bitstream -> iOS Safari decodeAudioData handles this in milliseconds!
+        audioBuffer = await decodeAudioBuffer(demuxResult.aacData.buffer);
+      } else if (demuxResult.rawPcmBuffer) {
+        audioBuffer = demuxResult.rawPcmBuffer;
+      }
+    } catch (demuxErr) {
+      console.warn('MP4Box demux failed or not MP4, falling back to direct decode:', demuxErr);
+      setProgress(50, 'Decoding media directly...');
+      audioBuffer = await decodeAudioBuffer(arrayBuffer);
     }
-    if (audioCtx.state === 'suspended') {
-      await audioCtx.resume();
+
+    if (!audioBuffer) {
+      throw new Error('Could not decode audio. Ensure the video contains an audio track.');
     }
 
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    setProgress(80, 'Analyzing audio & encoding WAV...');
+    setProgress(85, 'Analyzing audio & encoding lossless WAV...');
 
     // 3. Audio Analysis
-    const duration = audioBuffer.duration;
+    const duration = audioBuffer.duration || videoMeta.duration || 0;
     const channels = audioBuffer.numberOfChannels;
     const sampleRate = audioBuffer.sampleRate;
 
@@ -151,7 +185,7 @@ async function handleVideoFile(file) {
 
     // 4. Update UI Metrics
     valDuration.textContent = formatDuration(duration);
-    valResolution.textContent = videoMeta.width && videoMeta.height ? `${videoMeta.width} x ${videoMeta.height}` : 'Audio-only';
+    valResolution.textContent = videoMeta.width && videoMeta.height ? `${videoMeta.width} x ${videoMeta.height}` : 'Audio track';
     valSize.textContent = formatFileSize(file.size);
     valChannels.textContent = channels === 1 ? 'Mono (1 ch)' : channels === 2 ? 'Stereo (2 ch)' : `${channels} ch`;
     valSampleRate.textContent = `${(sampleRate / 1000).toFixed(1)} kHz`;
@@ -172,59 +206,163 @@ async function handleVideoFile(file) {
     setTimeout(() => {
       statusSection.classList.remove('active');
       analysisSection.classList.add('active');
-    }, 400);
+    }, 350);
 
   } catch (error) {
     console.error('Extraction error:', error);
     statusSection.classList.add('active');
     progressBar.style.width = '100%';
     progressBar.style.background = '#FF453A';
-    statusText.textContent = `Error: ${error.message || 'Could not extract audio. Ensure the video has an audio track.'}`;
+    statusText.textContent = `Error: ${error.message || 'Could not extract audio.'}`;
     
-    // Show reset option
     setTimeout(() => {
       dropZone.style.display = 'block';
-    }, 2500);
+    }, 4000);
   }
 }
 
-// Helper to inspect video dimensions and duration
-function extractVideoMetadata(file) {
-  return new Promise((resolve) => {
-    const video = document.createElement('video');
-    video.preload = 'metadata';
-    video.muted = true;
-    video.playsInline = true;
+// Read file with progress callbacks
+function readFileAsArrayBuffer(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(e.loaded, e.total);
+      }
+    };
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Failed to read video file.'));
+    reader.readAsArrayBuffer(file);
+  });
+}
 
-    const url = URL.createObjectURL(file);
-    video.src = url;
+// MP4/MOV Demuxer using MP4Box
+function demuxWithMP4Box(arrayBuffer) {
+  return new Promise((resolve, reject) => {
+    if (typeof MP4Box === 'undefined') {
+      reject(new Error('MP4Box library not loaded.'));
+      return;
+    }
 
-    const cleanup = () => {
-      URL.revokeObjectURL(url);
-      video.removeAttribute('src');
-      video.load();
+    const mp4boxfile = MP4Box.createFile();
+    let audioTrack = null;
+    let videoTrack = null;
+    const audioSamples = [];
+    let fileInfo = null;
+
+    mp4boxfile.onError = (e) => {
+      reject(new Error('MP4Box error: ' + (e ? e.message || e : 'Unknown parsing error')));
     };
 
-    video.onloadedmetadata = () => {
-      const meta = {
-        width: video.videoWidth || null,
-        height: video.videoHeight || null,
-        duration: video.duration || null
-      };
-      cleanup();
-      resolve(meta);
+    mp4boxfile.onReady = (info) => {
+      fileInfo = info;
+      videoTrack = info.tracks.find(t => t.type === 'video');
+      audioTrack = info.tracks.find(t => t.type === 'audio');
+
+      if (!audioTrack) {
+        reject(new Error('No audio track found in this video.'));
+        return;
+      }
+
+      // Start sample extraction for audio track
+      mp4boxfile.setExtractionOptions(audioTrack.id, null, { nbSamples: 200000 });
+      mp4boxfile.start();
     };
 
-    video.onerror = () => {
-      cleanup();
-      resolve({ width: null, height: null, duration: null });
+    mp4boxfile.onSamples = (id, user, samples) => {
+      if (audioTrack && id === audioTrack.id) {
+        audioSamples.push(...samples);
+      }
     };
 
-    // Timeout fallback after 3 seconds
+    // Feed buffer to MP4Box
+    try {
+      const bufferCopy = arrayBuffer.slice(0);
+      bufferCopy.fileStart = 0;
+      mp4boxfile.appendBuffer(bufferCopy);
+      mp4boxfile.flush();
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    if (!audioTrack || audioSamples.length === 0) {
+      reject(new Error('No audio samples extracted.'));
+      return;
+    }
+
+    // Video metadata
+    const videoMeta = {
+      width: videoTrack && videoTrack.video ? videoTrack.video.width : null,
+      height: videoTrack && videoTrack.video ? videoTrack.video.height : null,
+      duration: fileInfo.duration ? (fileInfo.duration / fileInfo.timescale) : null
+    };
+
+    const sampleRate = audioTrack.audio ? audioTrack.audio.sample_rate : 44100;
+    const channels = audioTrack.audio ? audioTrack.audio.channel_count : 2;
+
+    // Build ADTS AAC stream for AAC audio
+    if (audioTrack.codec && audioTrack.codec.startsWith('mp4a')) {
+      // Calculate total byte size (each sample + 7-byte ADTS header)
+      let totalLength = 0;
+      for (let i = 0; i < audioSamples.length; i++) {
+        totalLength += 7 + audioSamples[i].data.byteLength;
+      }
+
+      const aacData = new Uint8Array(totalLength);
+      let offset = 0;
+
+      const sampleRateIdx = AAC_SAMPLE_RATES[sampleRate] !== undefined ? AAC_SAMPLE_RATES[sampleRate] : 4;
+      const profile = 1; // AAC LC (object type 2 - 1)
+
+      for (let i = 0; i < audioSamples.length; i++) {
+        const sample = audioSamples[i];
+        const dataLen = sample.data.byteLength;
+        const frameLength = dataLen + 7;
+
+        // 7-byte ADTS Header
+        aacData[offset] = 0xFF;
+        aacData[offset + 1] = 0xF1;
+        aacData[offset + 2] = ((profile & 0x03) << 6) | ((sampleRateIdx & 0x0F) << 2) | ((channels >> 2) & 0x01);
+        aacData[offset + 3] = ((channels & 0x03) << 6) | ((frameLength >> 11) & 0x03);
+        aacData[offset + 4] = (frameLength >> 3) & 0xFF;
+        aacData[offset + 5] = ((frameLength & 0x07) << 5) | 0x1F;
+        aacData[offset + 6] = 0xFC;
+        offset += 7;
+
+        // Copy raw AAC sample bytes
+        aacData.set(new Uint8Array(sample.data), offset);
+        offset += dataLen;
+      }
+
+      resolve({ videoMeta, aacData });
+    } else {
+      // For non-AAC tracks, fallback to standard decoding
+      resolve({ videoMeta });
+    }
+  });
+}
+
+// Decode audio using Web Audio API with compatibility for iOS WebKit
+function decodeAudioBuffer(buffer) {
+  return new Promise((resolve, reject) => {
+    unlockAudioContext();
+
+    // Support both Promise and Callback signatures for WebKit
+    const promise = audioCtx.decodeAudioData(
+      buffer,
+      (decoded) => resolve(decoded),
+      (err) => reject(new Error('Audio decoding failed: ' + (err ? err.message || err : 'Unsupported audio format')))
+    );
+
+    if (promise && typeof promise.then === 'function') {
+      promise.then(resolve).catch(reject);
+    }
+
+    // Safety timeout in case Safari's decodeAudioData hangs
     setTimeout(() => {
-      cleanup();
-      resolve({ width: null, height: null, duration: null });
-    }, 3000);
+      reject(new Error('Decoding timed out. Video format may be unsupported.'));
+    }, 15000);
   });
 }
 
@@ -247,7 +385,6 @@ function drawWaveform(audioBuffer) {
 
   ctx.clearRect(0, 0, width, height);
 
-  // Gradient for waveform
   const gradient = ctx.createLinearGradient(0, 0, width, 0);
   gradient.addColorStop(0, '#0A84FF');
   gradient.addColorStop(0.5, '#5E5CE6');
@@ -288,34 +425,22 @@ function audioBufferToWav(buffer) {
   const arrayBuffer = new ArrayBuffer(bufferLength);
   const view = new DataView(arrayBuffer);
 
-  // RIFF identifier
+  // RIFF header
   writeString(view, 0, 'RIFF');
-  // RIFF chunk length
   view.setUint32(4, 36 + dataSize, true);
-  // RIFF type
   writeString(view, 8, 'WAVE');
-  // format chunk identifier
   writeString(view, 12, 'fmt ');
-  // format chunk length
   view.setUint32(16, 16, true);
-  // sample format (raw PCM)
   view.setUint16(20, format, true);
-  // channel count
   view.setUint16(22, numChannels, true);
-  // sample rate
   view.setUint32(24, sampleRate, true);
-  // byte rate (sample rate * block align)
   view.setUint32(28, sampleRate * blockAlign, true);
-  // block align
   view.setUint16(32, blockAlign, true);
-  // bits per sample
   view.setUint16(34, bitDepth, true);
-  // data chunk identifier
   writeString(view, 36, 'data');
-  // data chunk length
   view.setUint32(40, dataSize, true);
 
-  // Write PCM audio samples
+  // PCM samples
   let offset = 44;
   const channels = [];
   for (let c = 0; c < numChannels; c++) {
@@ -325,9 +450,7 @@ function audioBufferToWav(buffer) {
   for (let i = 0; i < length; i++) {
     for (let c = 0; c < numChannels; c++) {
       let sample = channels[c][i];
-      // Clamp between -1.0 and 1.0
       sample = Math.max(-1, Math.min(1, sample));
-      // Scale to 16-bit signed integer (-32768 to 32767)
       const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
       view.setInt16(offset, intSample, true);
       offset += 2;
@@ -359,7 +482,7 @@ downloadBtn.addEventListener('click', () => {
   }, 1000);
 });
 
-// Native iOS Share Sheet Button (Save to Files, AirDrop, etc.)
+// iOS Share Sheet
 shareBtn.addEventListener('click', async () => {
   if (!currentWavFile) return;
 
@@ -372,12 +495,10 @@ shareBtn.addEventListener('click', async () => {
       });
     } catch (err) {
       if (err.name !== 'AbortError') {
-        console.warn('Share sheet failed, falling back to download:', err);
         downloadBtn.click();
       }
     }
   } else {
-    // Fallback if Web Share API files is unavailable
     downloadBtn.click();
   }
 });

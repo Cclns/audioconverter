@@ -1,9 +1,10 @@
-const CACHE_NAME = 'audio-extractor-v1';
+const CACHE_NAME = 'audio-extractor-v2';
 const ASSETS = [
   './',
   './index.html',
   './styles.css',
   './app.js',
+  './mp4box.all.min.js',
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -35,11 +36,9 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  // Offline-first strategy
   event.respondWith(
     caches.match(event.request).then((cachedResponse) => {
       return cachedResponse || fetch(event.request).catch(() => {
-        // Fallback to cache index for navigation
         if (event.request.mode === 'navigate') {
           return caches.match('./index.html');
         }
